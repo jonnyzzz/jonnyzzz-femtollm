@@ -1,0 +1,23 @@
+{
+  "listen": ":8080",
+  "backends": [
+    {
+      "name": "vllm-local",
+      "pattern": "(?i)qwen.*coder",
+      "url": "http://localhost:8000",
+      "model": "Qwen/Qwen3-Coder-FP8"
+    },
+    {
+      "name": "openrouter",
+      "pattern": "(?i)(claude|gpt|sonnet|opus)",
+      "url": "https://openrouter.ai/api",
+      "api_key": "${OPENROUTER_API_KEY}"
+    },
+    {
+      "name": "fallback",
+      "pattern": ".*",
+      "url": "http://localhost:8000",
+      "model": "Qwen/Qwen3-Coder-FP8"
+    }
+  ]
+}
