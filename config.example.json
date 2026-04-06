@@ -1,23 +1,29 @@
 {
-  "listen": ":8080",
+  "listen": ":8880",
   "backends": [
     {
-      "name": "vllm-local",
-      "pattern": "(?i)qwen.*coder",
-      "url": "http://localhost:8000",
-      "model": "Qwen/Qwen3-Coder-FP8"
+      "name": "gemma4-vllm",
+      "pattern": "(?i)gemma",
+      "url": "http://spark-07:8004",
+      "model": "google/gemma-4-31B-it"
     },
     {
-      "name": "openrouter",
-      "pattern": "(?i)(claude|gpt|sonnet|opus)",
-      "url": "https://openrouter.ai/api",
-      "api_key": "${OPENROUTER_API_KEY}"
+      "name": "nemotron-vllm",
+      "pattern": "(?i)(nemotron|nvidia)",
+      "url": "http://spark-07:8003",
+      "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
     },
     {
-      "name": "fallback",
+      "name": "qwen3-coder",
+      "pattern": "(?i)(qwen|coder)",
+      "url": "http://spark-07:11434",
+      "model": "qwen3-coder:30b"
+    },
+    {
+      "name": "gemma4-default",
       "pattern": ".*",
-      "url": "http://localhost:8000",
-      "model": "Qwen/Qwen3-Coder-FP8"
+      "url": "http://spark-07:8004",
+      "model": "google/gemma-4-31B-it"
     }
   ]
 }
