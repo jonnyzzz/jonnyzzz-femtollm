@@ -31,8 +31,11 @@ func main() {
 	for _, b := range cfg.Backends {
 		log.Printf("  backend %s: pattern=%s url=%s", b.Name, b.Pattern, b.URL)
 	}
+	log.Printf("  health check: interval=%s timeout=%s", cfg.HealthInterval(), cfg.HealthTimeout())
 
 	srv := proxy.NewServer(cfg)
+	defer srv.Close()
+
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}

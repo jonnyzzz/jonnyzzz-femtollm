@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
+	"time"
 )
 
 // Backend defines an LLM backend with routing rules.
@@ -38,8 +40,40 @@ func (b *Backend) TargetModel(requestModel string) string {
 
 // Config holds the proxy configuration.
 type Config struct {
-	Listen   string    `json:"listen"`   // address to listen on (default ":8080")
-	Backends []Backend `json:"backends"` // ordered list of backends
+	Listen               string    `json:"listen"`                          // address to listen on (default ":8080")
+	Backends             []Backend `json:"backends"`                        // ordered list of backends
+	HealthCheckInterval  string    `json:"health_check_interval,omitempty"` // e.g. "30s" (default "30s")
+	HealthCheckTimeout   string    `json:"health_check_timeout,omitempty"`  // e.g. "5s" (default "5s")
+}
+
+// HealthInterval returns the parsed health check interval, or the default (30s).
+func (c *Config) HealthInterval() time.Duration {
+	if c.HealthCheckInterval != "" {
+		if d, err := time.ParseDuration(c.HealthCheckInterval); err == nil {
+			return d
+		}
+	}
+	return 30 * time.Second
+}
+
+// HealthTimeout returns the parsed health check timeout, or the default (5s).
+func (c *Config) HealthTimeout() time.Duration {
+	if c.HealthCheckTimeout != "" {
+		if d, err := time.ParseDuration(c.HealthCheckTimeout); err == nil {
+			return d
+		}
+	}
+	return 5 * time.Second
+}
+
+// ParseModelBackend splits "model@backend-name" into (model, backendName).
+// If no "@" is present, backendName is empty.
+func ParseModelBackend(raw string) (model, backendName string) {
+	idx := strings.IndexByte(raw, '@')
+	if idx < 0 {
+		return raw, ""
+	}
+	return raw[:idx], raw[idx+1:]
 }
 
 // Load reads configuration from a JSON file.

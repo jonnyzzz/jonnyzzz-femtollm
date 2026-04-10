@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/config"
@@ -261,6 +262,157 @@ func TestAnthropicMessages_ConvertsToOpenAI(t *testing.T) {
 	}
 	if len(resp.Content) == 0 || resp.Content[0].Text != "Converted response" {
 		t.Errorf("expected converted response text, got %v", resp.Content)
+	}
+}
+
+func TestChatCompletions_RoundRobin(t *testing.T) {
+	var countA, countB atomic.Int32
+
+	backendA := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			countA.Add(1)
+		}
+		chatCompletionHandler("from A")(w, r)
+	})
+	defer backendA.Close()
+
+	backendB := newTestBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			countB.Add(1)
+		}
+		chatCompletionHandler("from B")(w, r)
+	})
+	defer backendB.Close()
+
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "a", Pattern: `.*`, URL: backendA.URL},
+			{Name: "b", Pattern: `.*`, URL: backendB.URL},
+		},
+	}
+	for i := range cfg.Backends {
+		cfg.Backends[i].Match("test")
+	}
+
+	srv := NewServer(cfg)
+	defer srv.Close()
+
+	for i := 0; i < 10; i++ {
+		body := `{"model":"any","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, w.Code)
+		}
+	}
+
+	a, b := countA.Load(), countB.Load()
+	if a != 5 || b != 5 {
+		t.Errorf("expected 5/5 distribution, got a=%d b=%d", a, b)
+	}
+}
+
+func TestChatCompletions_BackendPreference(t *testing.T) {
+	backendA := newTestBackend(t, chatCompletionHandler("from A"))
+	defer backendA.Close()
+	backendB := newTestBackend(t, chatCompletionHandler("from B"))
+	defer backendB.Close()
+
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "alpha", Pattern: `.*`, URL: backendA.URL, Model: "model-a"},
+			{Name: "beta", Pattern: `.*`, URL: backendB.URL, Model: "model-b"},
+		},
+	}
+	for i := range cfg.Backends {
+		cfg.Backends[i].Match("test")
+	}
+
+	srv := NewServer(cfg)
+	defer srv.Close()
+
+	// Pin to "beta" backend
+	body := `{"model":"anything@beta","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp protocol.ChatResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Model != "model-b" {
+		t.Errorf("expected model-b (beta backend), got %s", resp.Model)
+	}
+}
+
+func TestChatCompletions_BackendPreference_NotFound(t *testing.T) {
+	backend := newTestBackend(t, chatCompletionHandler("hello"))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "real", Pattern: `.*`, URL: backend.URL},
+		},
+	}
+	for i := range cfg.Backends {
+		cfg.Backends[i].Match("test")
+	}
+
+	srv := NewServer(cfg)
+	defer srv.Close()
+
+	body := `{"model":"any@nonexistent","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown backend, got %d", w.Code)
+	}
+}
+
+func TestBackendHealthEndpoint(t *testing.T) {
+	backend := newTestBackend(t, chatCompletionHandler("hi"))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "test-be", Pattern: `.*`, URL: backend.URL},
+		},
+	}
+	for i := range cfg.Backends {
+		cfg.Backends[i].Match("test")
+	}
+
+	srv := NewServer(cfg)
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/health/backends", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp struct {
+		Backends []struct {
+			Name  string `json:"name"`
+			Alive bool   `json:"alive"`
+		} `json:"backends"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Backends) != 1 {
+		t.Fatalf("expected 1 backend, got %d", len(resp.Backends))
+	}
+	if !resp.Backends[0].Alive {
+		t.Error("expected backend to be alive")
 	}
 }
 

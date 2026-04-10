@@ -10,21 +10,42 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/balancer"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/config"
+	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/health"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/protocol"
 )
 
 // Server is the LLM proxy server.
 type Server struct {
-	Config *config.Config
-	Client *http.Client
+	Config   *config.Config
+	Client   *http.Client
+	Checker  *health.Checker
+	Balancer *balancer.Balancer
 }
 
-// NewServer creates a new proxy server.
+// NewServer creates a new proxy server with health checking and load balancing.
 func NewServer(cfg *config.Config) *Server {
+	var backends []health.Backend
+	for _, b := range cfg.Backends {
+		backends = append(backends, health.Backend{Name: b.Name, URL: b.URL})
+	}
+
+	checker := health.NewChecker(backends, cfg.HealthInterval(), cfg.HealthTimeout())
+	checker.Start()
+
 	return &Server{
-		Config: cfg,
-		Client: &http.Client{Timeout: 5 * time.Minute},
+		Config:   cfg,
+		Client:   &http.Client{Timeout: 5 * time.Minute},
+		Checker:  checker,
+		Balancer: balancer.NewBalancer(checker),
+	}
+}
+
+// Close stops background health checks.
+func (s *Server) Close() {
+	if s.Checker != nil {
+		s.Checker.Stop()
 	}
 }
 
@@ -46,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("/health/backends", s.handleBackendHealth)
 
 	return mux
 }
@@ -89,11 +111,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backends := s.Config.FindBackends(req.Model)
+	// Parse model@backend preference
+	model, preferredBackend := config.ParseModelBackend(req.Model)
+	req.Model = model
+
+	backends := s.Config.FindBackends(model)
+	if preferredBackend != "" {
+		backends = filterByName(backends, preferredBackend)
+	}
 	if len(backends) == 0 {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no backend for model %q", req.Model))
+		if preferredBackend != "" {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no backend named %q for model %q", preferredBackend, model))
+		} else {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no backend for model %q", model))
+		}
 		return
 	}
+
+	// Round-robin among healthy backends
+	backends = s.Balancer.Select(backends, model)
 
 	// Try backends in order (fallback)
 	var lastErr error
@@ -128,24 +164,36 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	if req.Stream {
-		// For streaming, convert to OpenAI and stream back
-		// TODO: implement streaming protocol conversion
 		writeError(w, http.StatusNotImplemented, "anthropic streaming not yet supported, use non-streaming")
 		return
 	}
 
-	backends := s.Config.FindBackends(req.Model)
+	// Parse model@backend preference
+	model, preferredBackend := config.ParseModelBackend(req.Model)
+	req.Model = model
+
+	backends := s.Config.FindBackends(model)
+	if preferredBackend != "" {
+		backends = filterByName(backends, preferredBackend)
+	}
 	if len(backends) == 0 {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no backend for model %q", req.Model))
+		if preferredBackend != "" {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no backend named %q for model %q", preferredBackend, model))
+		} else {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no backend for model %q", model))
+		}
 		return
 	}
+
+	// Round-robin among healthy backends
+	backends = s.Balancer.Select(backends, model)
 
 	// Convert to OpenAI format, send to backend, convert response back
 	openaiReq := protocol.AnthropicToOpenAI(&req)
 
 	var lastErr error
 	for _, backend := range backends {
-		openaiReq.Model = backend.TargetModel(req.Model)
+		openaiReq.Model = backend.TargetModel(model)
 
 		reqBody, _ := json.Marshal(openaiReq)
 		url := strings.TrimRight(backend.URL, "/") + "/v1/chat/completions"
@@ -260,4 +308,45 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 			"type":    "proxy_error",
 		},
 	})
+}
+
+func filterByName(backends []config.Backend, name string) []config.Backend {
+	var out []config.Backend
+	for _, b := range backends {
+		if b.Name == name {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func (s *Server) handleBackendHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type entry struct {
+		Name      string `json:"name"`
+		URL       string `json:"url"`
+		Alive     bool   `json:"alive"`
+		LastCheck string `json:"last_check,omitempty"`
+		LastError string `json:"last_error,omitempty"`
+	}
+
+	statuses := s.Checker.Statuses()
+	var entries []entry
+	for _, b := range s.Config.Backends {
+		e := entry{Name: b.Name, URL: b.URL}
+		if st, ok := statuses[b.Name]; ok {
+			e.Alive = st.Alive
+			if !st.LastCheck.IsZero() {
+				e.LastCheck = st.LastCheck.Format(time.RFC3339)
+			}
+			e.LastError = st.LastError
+		}
+		entries = append(entries, e)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"backends": entries})
 }

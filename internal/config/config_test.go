@@ -110,6 +110,42 @@ func TestFindBackends(t *testing.T) {
 	}
 }
 
+func TestParseModelBackend(t *testing.T) {
+	tests := []struct {
+		raw     string
+		model   string
+		backend string
+	}{
+		{"gemma4", "gemma4", ""},
+		{"gemma4@vllm-1", "gemma4", "vllm-1"},
+		{"qwen3-coder@qwen-backend", "qwen3-coder", "qwen-backend"},
+		{"model@", "model", ""},
+		{"@backend", "", "backend"},
+		{"a@b@c", "a", "b@c"},
+	}
+	for _, tt := range tests {
+		model, backend := ParseModelBackend(tt.raw)
+		if model != tt.model || backend != tt.backend {
+			t.Errorf("ParseModelBackend(%q) = (%q, %q), want (%q, %q)",
+				tt.raw, model, backend, tt.model, tt.backend)
+		}
+	}
+}
+
+func TestHealthInterval_Default(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.HealthInterval(); got != 30*1e9 {
+		t.Errorf("expected 30s default, got %v", got)
+	}
+}
+
+func TestHealthInterval_Custom(t *testing.T) {
+	cfg := &Config{HealthCheckInterval: "10s"}
+	if got := cfg.HealthInterval(); got != 10*1e9 {
+		t.Errorf("expected 10s, got %v", got)
+	}
+}
+
 func TestAdvertisedModels(t *testing.T) {
 	cfg := &Config{
 		Backends: []Backend{
