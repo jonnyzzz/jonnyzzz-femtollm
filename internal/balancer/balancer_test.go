@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/config"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/health"
+	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/prefixtrie"
 )
 
 func backends(names ...string) []config.Backend {
@@ -34,7 +36,7 @@ func vllmServer(t *testing.T, kvCache float64, running, waiting int) *httptest.S
 }
 
 func TestSelect_RoundRobin(t *testing.T) {
-	b := NewBalancer(nil) // nil checker = all healthy, no metrics
+	b := NewBalancer(nil, nil) // nil checker = all healthy, no metrics
 	bs := backends("a", "b", "c")
 
 	counts := map[string]int{}
@@ -63,7 +65,7 @@ func TestSelect_FiltersUnhealthy(t *testing.T) {
 	}, time.Hour, 1*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "alive", URL: alive.URL},
 		{Name: "dead", URL: deadURL},
@@ -89,7 +91,7 @@ func TestSelect_AllDead_FailOpen(t *testing.T) {
 	}, time.Hour, 1*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := backends("a", "b")
 
 	selected := b.Select(bs, "model")
@@ -99,7 +101,7 @@ func TestSelect_AllDead_FailOpen(t *testing.T) {
 }
 
 func TestSelect_SingleBackend(t *testing.T) {
-	b := NewBalancer(nil)
+	b := NewBalancer(nil, nil)
 	bs := backends("only")
 
 	selected := b.Select(bs, "model")
@@ -109,7 +111,7 @@ func TestSelect_SingleBackend(t *testing.T) {
 }
 
 func TestSelect_Empty(t *testing.T) {
-	b := NewBalancer(nil)
+	b := NewBalancer(nil, nil)
 	selected := b.Select(nil, "model")
 	if len(selected) != 0 {
 		t.Error("expected empty result for empty input")
@@ -117,7 +119,7 @@ func TestSelect_Empty(t *testing.T) {
 }
 
 func TestSelect_PreferredAlwaysFirst(t *testing.T) {
-	b := NewBalancer(nil)
+	b := NewBalancer(nil, nil)
 	bs := []config.Backend{
 		{Name: "regular-a", URL: "http://a"},
 		{Name: "preferred", URL: "http://p", Preferred: true},
@@ -148,7 +150,7 @@ func TestSelect_PreferredDown_FallsBackToRoundRobin(t *testing.T) {
 	}, time.Hour, 1*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "preferred", URL: deadURL, Preferred: true},
 		{Name: "fallback-a", URL: aServer.URL},
@@ -188,7 +190,7 @@ func TestSelect_KVCacheAware(t *testing.T) {
 	}, time.Hour, 5*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "spark", URL: spark.URL, Preferred: true},
 		{Name: "thor", URL: thor.URL},
@@ -219,7 +221,7 @@ func TestSelect_PreferredWinsWhenIdle(t *testing.T) {
 	}, time.Hour, 5*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "spark", URL: spark.URL, Preferred: true},
 		{Name: "thor", URL: thor.URL},
@@ -248,7 +250,7 @@ func TestSelect_RoutesToLeastLoadedWithoutPreference(t *testing.T) {
 	}, time.Hour, 5*time.Second)
 	checker.CheckNow()
 
-	b := NewBalancer(checker)
+	b := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "heavy", URL: heavy.URL},
 		{Name: "light", URL: light.URL},
@@ -276,7 +278,7 @@ func TestSelect_BothEquallyLoaded_RoundRobins(t *testing.T) {
 	}, time.Hour, 5*time.Second)
 	checker.CheckNow()
 
-	bal := NewBalancer(checker)
+	bal := NewBalancer(checker, nil)
 	bs := []config.Backend{
 		{Name: "a", URL: a.URL},
 		{Name: "b", URL: b2.URL},
@@ -290,5 +292,146 @@ func TestSelect_BothEquallyLoaded_RoundRobins(t *testing.T) {
 
 	if counts["a"] != 5 || counts["b"] != 5 {
 		t.Errorf("expected 5/5 round-robin for equal load, got a=%d b=%d", counts["a"], counts["b"])
+	}
+}
+
+// pad returns a string of exactly n chars.
+func pad(s string, n int) string {
+	if len(s) >= n {
+		return s[:n]
+	}
+	return s + strings.Repeat(".", n-len(s))
+}
+
+// TestSelectWithPrompt_PrefixCacheRouting verifies that requests with shared
+// prefixes are routed to the backend that previously served that prefix.
+func TestSelectWithPrompt_PrefixCacheRouting(t *testing.T) {
+	a := vllmServer(t, 0.3, 1, 0)
+	defer a.Close()
+	b2 := vllmServer(t, 0.3, 1, 0)
+	defer b2.Close()
+
+	checker := health.NewChecker([]health.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}, time.Hour, 5*time.Second)
+	checker.CheckNow()
+
+	trie := prefixtrie.New(128)
+	bal := NewBalancer(checker, trie)
+	bs := []config.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}
+
+	// System prompt shared across all requests (2 full chunks = 256 chars)
+	systemPrompt := pad("You are a helpful assistant.", 128) + pad("Be concise.", 128)
+
+	// First request: routes to some backend (round-robin). Record it.
+	prompt1 := systemPrompt + pad("User: hello", 128)
+	selected1 := bal.SelectWithPrompt(bs, "model", prompt1)
+	firstBackend := selected1[0].Name
+	bal.RecordRoute(prompt1, firstBackend)
+
+	// Second request with same system prompt prefix: should prefer the same backend
+	prompt2 := systemPrompt + pad("User: how are you?", 128)
+	for i := 0; i < 5; i++ {
+		selected := bal.SelectWithPrompt(bs, "model", prompt2)
+		if selected[0].Name != firstBackend {
+			t.Errorf("request %d: expected %s (prefix cached), got %s", i, firstBackend, selected[0].Name)
+		}
+	}
+}
+
+// TestSelectWithPrompt_DifferentPrefixesDifferentBackends verifies that requests
+// with different prefixes can be routed to different backends.
+func TestSelectWithPrompt_DifferentPrefixesDifferentBackends(t *testing.T) {
+	a := vllmServer(t, 0.3, 1, 0)
+	defer a.Close()
+	b2 := vllmServer(t, 0.3, 1, 0)
+	defer b2.Close()
+
+	checker := health.NewChecker([]health.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}, time.Hour, 5*time.Second)
+	checker.CheckNow()
+
+	trie := prefixtrie.New(128)
+	bal := NewBalancer(checker, trie)
+	bs := []config.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}
+
+	// Two completely different system prompts
+	promptA := pad("System: You are a code assistant", 128) + pad("User: write code", 128)
+	promptB := pad("System: You are a math tutor", 128) + pad("User: solve equation", 128)
+
+	// Route promptA to backend a
+	bal.RecordRoute(promptA, "a")
+	// Route promptB to backend b
+	bal.RecordRoute(promptB, "b")
+
+	// New request with promptA prefix should go to a
+	newA := pad("System: You are a code assistant", 128) + pad("User: fix this bug", 128)
+	selected := bal.SelectWithPrompt(bs, "model", newA)
+	if selected[0].Name != "a" {
+		t.Errorf("expected backend a for code prompt prefix, got %s", selected[0].Name)
+	}
+
+	// New request with promptB prefix should go to b
+	newB := pad("System: You are a math tutor", 128) + pad("User: derive formula", 128)
+	selected = bal.SelectWithPrompt(bs, "model", newB)
+	if selected[0].Name != "b" {
+		t.Errorf("expected backend b for math prompt prefix, got %s", selected[0].Name)
+	}
+}
+
+// TestSelectWithPrompt_EmptyPromptFallsBackToLoadBalancing verifies that
+// without a prompt, the balancer falls back to load-based routing.
+func TestSelectWithPrompt_EmptyPromptFallsBackToLoadBalancing(t *testing.T) {
+	a := vllmServer(t, 0.1, 0, 0)
+	defer a.Close()
+	b2 := vllmServer(t, 0.8, 5, 0)
+	defer b2.Close()
+
+	checker := health.NewChecker([]health.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}, time.Hour, 5*time.Second)
+	checker.CheckNow()
+
+	trie := prefixtrie.New(128)
+	bal := NewBalancer(checker, trie)
+	bs := []config.Backend{
+		{Name: "a", URL: a.URL},
+		{Name: "b", URL: b2.URL},
+	}
+
+	// Empty prompt: should route by load (a is less loaded)
+	selected := bal.SelectWithPrompt(bs, "model", "")
+	if selected[0].Name != "a" {
+		t.Errorf("expected least-loaded backend a, got %s", selected[0].Name)
+	}
+}
+
+func TestTrieStats_ExposedViaBalancer(t *testing.T) {
+	trie := prefixtrie.New(128)
+	bal := NewBalancer(nil, trie)
+
+	// Initially zero stats
+	stats := bal.TrieStats()
+	if stats == nil {
+		t.Fatal("expected non-nil stats with trie enabled")
+	}
+	if stats.Nodes != 1 {
+		t.Errorf("expected 1 root node, got %d", stats.Nodes)
+	}
+
+	// Without trie, nil stats
+	balNoTrie := NewBalancer(nil, nil)
+	if balNoTrie.TrieStats() != nil {
+		t.Error("expected nil stats without trie")
 	}
 }

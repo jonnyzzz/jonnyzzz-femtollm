@@ -13,6 +13,7 @@ import (
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/balancer"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/config"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/health"
+	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/prefixtrie"
 	"github.com/jonnyzzz/jonnyzzz-femtollm/internal/protocol"
 )
 
@@ -34,11 +35,13 @@ func NewServer(cfg *config.Config) *Server {
 	checker := health.NewChecker(backends, cfg.HealthInterval(), cfg.HealthTimeout())
 	checker.Start()
 
+	trie := prefixtrie.New(prefixtrie.DefaultChunkSize)
+
 	return &Server{
 		Config:   cfg,
 		Client:   &http.Client{Timeout: 5 * time.Minute},
 		Checker:  checker,
-		Balancer: balancer.NewBalancer(checker),
+		Balancer: balancer.NewBalancer(checker, trie),
 	}
 }
 
@@ -129,14 +132,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Round-robin among healthy backends
-	backends = s.Balancer.Select(backends, model)
+	// Extract prompt for prefix-cache routing
+	prompt := extractPrompt(&req)
+
+	// Select backend using load + prefix-cache scoring
+	backends = s.Balancer.SelectWithPrompt(backends, model, prompt)
 
 	// Try backends in order (fallback)
 	var lastErr error
 	for _, backend := range backends {
 		err := s.forwardOpenAI(w, r, body, &req, &backend)
 		if err == nil {
+			// Record successful route for prefix trie
+			s.Balancer.RecordRoute(prompt, backend.Name)
 			return
 		}
 		lastErr = err
@@ -186,8 +194,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Round-robin among healthy backends
-	backends = s.Balancer.Select(backends, model)
+	// Extract prompt for prefix-cache routing
+	prompt := extractAnthropicPrompt(&req)
+
+	// Select backend using load + prefix-cache scoring
+	backends = s.Balancer.SelectWithPrompt(backends, model, prompt)
 
 	// Convert to OpenAI format, send to backend, convert response back
 	openaiReq := protocol.AnthropicToOpenAI(&req)
@@ -239,6 +250,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 
 		anthropicResp := protocol.OpenAIToAnthropicResponse(&openaiResp)
+		s.Balancer.RecordRoute(prompt, backend.Name)
 		writeJSON(w, http.StatusOK, anthropicResp)
 		return
 	}
@@ -294,6 +306,41 @@ func (s *Server) forwardOpenAI(w http.ResponseWriter, r *http.Request, body []by
 	_, _ = io.Copy(w, resp.Body)
 	resp.Body.Close()
 	return nil
+}
+
+// extractPrompt concatenates message contents from a ChatRequest for prefix matching.
+func extractPrompt(req *protocol.ChatRequest) string {
+	var b strings.Builder
+	for _, msg := range req.Messages {
+		// Content can be a string or array of content parts
+		var s string
+		if err := json.Unmarshal(msg.Content, &s); err == nil {
+			b.WriteString(s)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// extractAnthropicPrompt concatenates message contents from an AnthropicRequest.
+func extractAnthropicPrompt(req *protocol.AnthropicRequest) string {
+	var b strings.Builder
+	// Include system prompt as prefix
+	if len(req.System) > 0 {
+		var s string
+		if err := json.Unmarshal(req.System, &s); err == nil {
+			b.WriteString(s)
+			b.WriteByte('\n')
+		}
+	}
+	for _, msg := range req.Messages {
+		var s string
+		if err := json.Unmarshal(msg.Content, &s); err == nil {
+			b.WriteString(s)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -356,5 +403,9 @@ func (s *Server) handleBackendHealth(w http.ResponseWriter, r *http.Request) {
 		entries = append(entries, e)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"backends": entries})
+	resp := map[string]any{"backends": entries}
+	if ts := s.Balancer.TrieStats(); ts != nil {
+		resp["prefix_trie"] = ts
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
