@@ -1,6 +1,8 @@
 services:
   femtollm:
     build: .
+    # tini as PID 1 so orphaned subprocesses are reaped. Required by stevedore.
+    init: true
     restart: on-failure:5
     volumes:
       - ${STEVEDORE_DATA:-./data}:/data
